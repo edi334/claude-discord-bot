@@ -218,7 +218,10 @@ async def claude_command(
     ok, result = await run_claude(prompt, tool_profile)
     elapsed = time.monotonic() - start
 
-    header = f"{'✅' if ok else '❌'} `{tool_profile}` · {elapsed:.1f}s\n"
+    header = (
+        f"<@{OWNER_DISCORD_ID}> {'✅' if ok else '❌'} `{tool_profile}` · "
+        f"{elapsed:.1f}s\n"
+    )
     body = result if result else "(empty result)"
 
     if len(header) + len(body) <= 1900:
