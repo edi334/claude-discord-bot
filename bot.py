@@ -8,6 +8,7 @@ in a single designated Discord channel.
 
 import asyncio
 import contextlib
+import datetime
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,6 +31,14 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 MAX_TURNS = os.environ.get("CLAUDE_MAX_TURNS", "15")
 CONFIRM_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_CONFIRM_TIMEOUT_SECONDS", "60"))
+
+_expires_raw = os.environ.get("CLAUDE_TOKEN_EXPIRES_ON", "").strip()
+TOKEN_EXPIRES_ON: datetime.date | None = (
+    datetime.date.fromisoformat(_expires_raw) if _expires_raw else None
+)
+TOKEN_WARN_DAYS = {
+    int(x) for x in os.environ.get("CLAUDE_TOKEN_WARN_DAYS", "30,14,7,3,1,0").split(",") if x.strip()
+}
 
 TOOL_PROFILES = {
     "readonly": "Read,Grep,Glob",
@@ -50,6 +60,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("claude-discord-bot")
+
+if TOKEN_EXPIRES_ON is None:
+    log.warning(
+        "CLAUDE_TOKEN_EXPIRES_ON is not set — the bot can't warn you before "
+        "the Claude Code auth token expires. Set it in .env (see .env.example)."
+    )
 
 if not CLAUDE_WORKDIR.is_dir():
     raise SystemExit(f"CLAUDE_WORKDIR does not exist: {CLAUDE_WORKDIR}")
@@ -216,12 +232,80 @@ async def claude_command(
         )
 
 
+def _token_status_line() -> str:
+    if TOKEN_EXPIRES_ON is None:
+        return "⚪ Claude token expiry not tracked (set `CLAUDE_TOKEN_EXPIRES_ON` in `.env`)."
+    days_left = (TOKEN_EXPIRES_ON - datetime.date.today()).days
+    if days_left < 0:
+        return f"🔴 Claude token **expired {abs(days_left)} day(s) ago** ({TOKEN_EXPIRES_ON.isoformat()})."
+    if days_left == 0:
+        return f"🟠 Claude token **expires today** ({TOKEN_EXPIRES_ON.isoformat()})."
+    return f"🟢 Claude token expires in **{days_left} day(s)** ({TOKEN_EXPIRES_ON.isoformat()})."
+
+
+@tree.command(name="claude-status", description="Show the bot's config and Claude auth token expiry")
+async def claude_status_command(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_DISCORD_ID:
+        await interaction.response.send_message(
+            "You're not authorized to run this command.", ephemeral=True
+        )
+        return
+
+    if interaction.channel_id != CLAUDE_CHANNEL_ID:
+        await interaction.response.send_message(
+            "This command only works in the #claude channel.", ephemeral=True
+        )
+        return
+
+    lines = [f"Workdir: `{CLAUDE_WORKDIR}`", _token_status_line()]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tasks.loop(hours=24)
+async def check_token_expiry():
+    if TOKEN_EXPIRES_ON is None:
+        return
+
+    days_left = (TOKEN_EXPIRES_ON - datetime.date.today()).days
+    if days_left not in TOKEN_WARN_DAYS and days_left >= 0:
+        return
+
+    channel = client.get_channel(CLAUDE_CHANNEL_ID)
+    if channel is None:
+        log.warning("Can't find channel %s to send token expiry warning", CLAUDE_CHANNEL_ID)
+        return
+
+    mention = f"<@{OWNER_DISCORD_ID}>"
+    if days_left < 0:
+        msg = (
+            f"🔴 {mention} The Claude Code auth token **expired {abs(days_left)} day(s) ago** "
+            f"({TOKEN_EXPIRES_ON.isoformat()}). Run `claude setup-token`, update "
+            f"`CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_EXPIRES_ON` in `.env`, then restart the bot."
+        )
+    elif days_left == 0:
+        msg = (
+            f"🟠 {mention} The Claude Code auth token **expires today** "
+            f"({TOKEN_EXPIRES_ON.isoformat()}). Run `claude setup-token` to renew it."
+        )
+    else:
+        msg = (
+            f"🟡 {mention} The Claude Code auth token expires in **{days_left} day(s)** "
+            f"({TOKEN_EXPIRES_ON.isoformat()}). Run `claude setup-token` to renew it, then "
+            f"update `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_EXPIRES_ON` in `.env` and restart."
+        )
+
+    await channel.send(msg)
+    log.info("Sent token expiry warning: %s day(s) left", days_left)
+
+
 @client.event
 async def on_ready():
     await tree.sync()
+    if TOKEN_EXPIRES_ON is not None and not check_token_expiry.is_running():
+        check_token_expiry.start()
     log.info(
-        "Logged in as %s. Workdir: %s. Restricted to channel ID %s.",
-        client.user, CLAUDE_WORKDIR, CLAUDE_CHANNEL_ID,
+        "Logged in as %s. Workdir: %s. Restricted to channel ID %s. %s",
+        client.user, CLAUDE_WORKDIR, CLAUDE_CHANNEL_ID, _token_status_line(),
     )
 
 

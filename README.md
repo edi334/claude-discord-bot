@@ -76,11 +76,10 @@ Users and Groups → Users** → right-click → **New User…**. The consumer
 `New-LocalUser`/Computer Management are the equivalents.)
 
 **Don't add `claudebot` to Remote Desktop Users.** It doesn't need to log in
-interactively over RDP — step 3c and step 4 below run its commands from
-*your* admin session via `runas` instead, so it never needs its own remote
-session. Keeping it out of Remote Desktop Users means even a compromised
-`claudebot` password can't be used to open a graphical session on the
-server.
+interactively over RDP — step 4 below runs its commands from *your* admin
+session via `runas` instead, so it never needs its own remote session.
+Keeping it out of Remote Desktop Users means even a compromised `claudebot`
+password can't be used to open a graphical session on the server.
 
 **3b. Put the bot and the project folder somewhere claudebot can reach**
 
@@ -112,36 +111,36 @@ system folders, or other users' profiles) — that's the actual sandbox.
   lands in `Program Files` and every account can run it.
 - Install the Claude Code CLI (via npm — if so, install Node.js "for all
   users" too, same reasoning).
-- Authenticate Claude Code as `claudebot`, without giving it a real login
-  session. From your own admin PowerShell/RDP session, run:
+- Authenticate: rather than logging `claudebot` in interactively (which
+  would need `runas` plus a browser inside that session), generate a
+  long-lived token tied to your existing claude.ai subscription and hand it
+  to the bot as an environment variable instead. On **any** machine with a
+  browser — your own laptop is fine, it doesn't need to be the server or the
+  `claudebot` account — run:
 
   ```powershell
-  runas /user:claudebot powershell
+  claude setup-token
   ```
 
-  Enter `claudebot`'s password when prompted — this opens a new PowerShell
-  window running under `claudebot`'s account, inside your current desktop
-  session (no separate RDP connection, no Remote Desktop Users membership
-  needed). In that window run:
+  This prints a token valid for one year, authenticated against your
+  subscription (Pro/Max/Team). Paste it into `.env` as
+  `CLAUDE_CODE_OAUTH_TOKEN` in step 4 below — `claudebot` never needs to log
+  in itself, and this bot's invocation doesn't use `--bare`, so it's
+  compatible with that token.
 
-  ```powershell
-  claude
-  ```
-
-  and complete login. This stores Claude's credentials under `claudebot`'s
-  own profile, separate from your personal Claude session.
-
-  **Simpler alternative:** if you'd rather skip the interactive/browser login
-  entirely, Claude Code also accepts an API key via the `ANTHROPIC_API_KEY`
-  environment variable — set that for `claudebot` (e.g. in the `.env` file in
-  step 4, or as a user environment variable on that account) instead of
-  running `claude` to log in. Cleaner for a service account, and avoids any
-  browser-launching-under-a-different-user complications on a server.
+  (Alternative: `ANTHROPIC_API_KEY` from https://console.anthropic.com/ also
+  works, but bills separately from your subscription rather than using it.)
 
 ## 4. Configure the bot
 
-Keep using that same `runas /user:claudebot powershell` window for
-everything below, so files end up owned by `claudebot`, not by you:
+Run this as `claudebot` so the venv and files end up owned by it, not by
+you — open a fresh elevated session with:
+
+```powershell
+runas /user:claudebot powershell
+```
+
+Then, in that window:
 
 ```powershell
 cd C:\Services\claude-discord-bot
@@ -157,6 +156,10 @@ Fill in `.env`:
 - `OWNER_DISCORD_ID` — from step 2
 - `CLAUDE_CHANNEL_ID` — from step 2
 - `CLAUDE_WORKDIR` — `C:\Services\claude-project` (or wherever you put it in step 3b)
+- `CLAUDE_CODE_OAUTH_TOKEN` — from step 3c (`claude setup-token`)
+- `CLAUDE_TOKEN_EXPIRES_ON` — today's date plus one year, e.g. if you ran
+  `claude setup-token` on 2026-08-16, set `2027-08-16`. This is what powers
+  the expiry warnings described below — see "Token expiry warnings".
 - `CLAUDE_BIN` — usually not needed if `claude` is on PATH; set it if not
 - `CLAUDE_CONFIRM_TIMEOUT_SECONDS` — optional, how long the Run/Cancel button
   waits for `tools:full` requests before auto-cancelling (default 60)
@@ -244,8 +247,13 @@ from step 4: set `CLAUDE_WORKDIR=C:\workdir` — that's the path *inside* the
 container, mapped to `C:\Services\claude-project` on the host via the volume
 mount in `docker-compose.yml`.
 
-Since there's no easy interactive browser login inside a container, use the
-`ANTHROPIC_API_KEY` line in `.env` instead of running `claude` to log in.
+For auth, there's no browser inside the container, so run `claude setup-token`
+on any machine that does have one (your laptop is fine) and put the result
+in `.env` as `CLAUDE_CODE_OAUTH_TOKEN` — this authenticates against your
+existing claude.ai subscription rather than a separate API key, and the
+token just needs to exist as an env var inside the container, no login step
+required there. (`ANTHROPIC_API_KEY` still works too, if you'd rather bill
+separately via the Anthropic Console instead of your subscription.)
 
 **7b. Build and run with Docker Compose**
 
@@ -293,6 +301,28 @@ Check it came up with `docker compose logs -f` — you should see the same
 **Optional cleanup:** if you already created the `claudebot` Windows account
 for the earlier approach, you no longer need it — see "Removing the
 claudebot account" below.
+
+## Token expiry warnings
+
+`claude setup-token` tokens are valid for one year, and it's easy to forget.
+As long as `CLAUDE_TOKEN_EXPIRES_ON` is set in `.env`, the bot handles this
+two ways:
+
+- **Automatic warnings in `#claude`**, once a day, when the token has 30,
+  14, 7, 3, 1, or 0 days left (configurable via `CLAUDE_TOKEN_WARN_DAYS`).
+  If it's overdue, it warns every day until you fix it — it doesn't stop
+  nagging on its own.
+- **`/claude-status`** — run it anytime to see the workdir and a live
+  countdown, without waiting for a scheduled warning.
+
+When you get the warning: run `claude setup-token` again, update both
+`CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_EXPIRES_ON` in `.env`, then
+restart the bot (`docker compose up -d --build` for the container path, or
+restart the Task Scheduler task / re-run `python bot.py` for the
+account-based path).
+
+If `CLAUDE_TOKEN_EXPIRES_ON` is left blank, none of this runs, and the bot
+logs a one-time warning on startup reminding you it's not tracked.
 
 ## Removing the claudebot account
 
