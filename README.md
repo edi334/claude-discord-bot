@@ -13,9 +13,9 @@ Locked down by design:
 - `tools:full` (Bash/shell access) requires an explicit Run/Cancel button
   click before anything executes — it doesn't run automatically just because
   you typed the command. `readonly` and `edit` still run immediately.
-- Runs under a dedicated low-privilege Windows account (set up in step 3
-  below) instead of your main admin account, so the OS itself limits the
-  blast radius if a prompt ever does something unintended.
+- Runs either under a dedicated low-privilege Windows account (step 3) or,
+  for stronger isolation, inside a Hyper-V isolated Windows container (step
+  7) that can't see the host filesystem at all beyond one mounted folder.
 
 ## 1. Create the Discord application
 
@@ -214,6 +214,118 @@ Windows edition.
 
 To stop/disable later: right-click the task → **Disable** or **End**.
 
+## 7. Container deployment (strongest isolation — recommended over steps 3/5/6)
+
+If you want the bot to have **zero visibility into the rest of the host
+filesystem, not even read**, run it inside a Hyper-V isolated Windows
+container instead of as the `claudebot` account directly. Bare metal +
+Windows Server 2025 + Docker (your setup) supports this natively — no nested
+virtualization needed.
+
+With `--isolation=hyperv`, the container runs its own kernel. It cannot see
+`C:\Windows`, `C:\Users`, other drives, or anything else on the host — only
+whatever you explicitly mount with `-v`. This replaces steps 3 (the
+low-privilege account), 5 (manual run), and 6 (Task Scheduler) entirely; you
+still need steps 1, 2, and 4 (Discord app, IDs, `.env` values).
+
+**7a. Prepare the project folder and `.env`**
+
+You don't need the `C:\Services\claude-discord-bot` NTFS permissions from
+step 3b anymore — the container boundary replaces that. You do still need
+the project folder Claude is allowed to touch:
+
+```powershell
+mkdir C:\Services\claude-project
+mkdir C:\Services\claude-discord-bot\logs
+```
+
+Edit `.env` (copy from `.env.example` if you haven't) with one difference
+from step 4: set `CLAUDE_WORKDIR=C:\workdir` — that's the path *inside* the
+container, mapped to `C:\Services\claude-project` on the host via the volume
+mount in `docker-compose.yml`.
+
+Since there's no easy interactive browser login inside a container, use the
+`ANTHROPIC_API_KEY` line in `.env` instead of running `claude` to log in.
+
+**7b. Build and run with Docker Compose**
+
+`docker-compose.yml` is already in the repo, alongside the `Dockerfile`. It
+builds the image, runs it with `--isolation=hyperv`, and mounts the same two
+folders as before. From `C:\Services\claude-discord-bot` on the server:
+
+```powershell
+docker compose up -d --build
+```
+
+If the base image tag in the `Dockerfile`
+(`python:3.12-windowsservercore-ltsc2025`) isn't published yet, swap it for
+the closest available tag (e.g. `-ltsc2022`) — Hyper-V isolation doesn't
+require the image build to match the host build the way process isolation
+does.
+
+I can't build/test this image myself (no Windows container runtime
+available where I'm running) — build it and send me any errors and we'll
+fix them together.
+
+Useful commands:
+```powershell
+docker compose logs -f          # tail the bot's output
+docker compose up -d --build    # rebuild and restart after editing bot.py
+docker compose down             # stop and remove the container
+```
+
+- `--isolation=hyperv` is the actual isolation boundary — don't drop it.
+- `--restart unless-stopped` makes Docker bring the container back after a
+  reboot or crash, standing in for Task Scheduler/NSSM.
+- The two `-v` mounts are the *only* host paths this container can see.
+  Everything else on the server — other drives, `C:\Users`, `C:\ProgramData`,
+  even most of `C:\Windows` beyond what's baked into the image — is invisible
+  to it, regardless of a `tools:full` Bash command trying to reach outside
+  `C:\workdir`.
+
+Check it came up with `docker compose logs -f` — you should see the same
+`Logged in as <botname>` line as the manual-run test in step 5. Test
+`/claude` in Discord as before.
+
+**To update the bot later:** edit `bot.py`/`requirements.txt`, then
+`docker compose up -d --build` again.
+
+**Optional cleanup:** if you already created the `claudebot` Windows account
+for the earlier approach, you no longer need it — see "Removing the
+claudebot account" below.
+
+## Removing the claudebot account
+
+Since the bot now runs isolated in a container, `claudebot` isn't doing any
+security work anymore and can be deleted. As Administrator:
+
+```powershell
+# 1. Drop its explicit permissions from the two folders (do this before
+#    deleting the account, while the name still resolves)
+icacls "C:\Services\claude-discord-bot" /remove claudebot
+icacls "C:\Services\claude-project" /remove claudebot
+
+# 2. If you created a Task Scheduler task for it (step 6), remove that too
+Unregister-ScheduledTask -TaskName "Claudiu Remote Bot" -Confirm:$false -ErrorAction SilentlyContinue
+
+# 3. Delete its user profile (registry hive + C:\Users\claudebot folder)
+Get-CimInstance -ClassName Win32_UserProfile |
+    Where-Object { $_.LocalPath -like "*\claudebot" } |
+    Remove-CimInstance
+
+# 4. Delete the account itself
+Remove-LocalUser -Name "claudebot"
+```
+
+Confirm it's gone:
+
+```powershell
+Get-LocalUser -Name "claudebot"
+```
+
+This should error with "No local user found" rather than showing the
+account.
+
 ## Notes / limitations
 
 - **Only readonly/edit/full tool profiles are exposed** — no arbitrary
@@ -226,8 +338,9 @@ To stop/disable later: right-click the task → **Disable** or **End**.
   `CLAUDE_MAX_TURNS` (default 15) to prevent a single prompt from running away.
 - `tools:full` additionally requires a Run/Cancel button click, owner-only,
   before the command executes.
-- `claudebot`'s account permissions are the real backstop for `tools:full` —
-  keep it out of the Administrators group and don't grant it access beyond
-  the two folders in step 3b.
+- The real backstop for `tools:full` is whichever isolation you used: either
+  `claudebot`'s limited account permissions (step 3), or, more strongly, the
+  Hyper-V container boundary (step 7) — pick one, don't rely on the
+  Discord-side confirmation button alone.
 - Everything is logged to `logs/bot.log`, including rejected/unauthorized
   attempts and confirm/cancel/timeout decisions.

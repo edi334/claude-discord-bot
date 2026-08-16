@@ -1,0 +1,12 @@
+services:
+  claudiu-remote:
+    build: .
+    image: claudiu-remote
+    container_name: claudiu-remote
+    isolation: hyperv
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - C:\Services\claude-project:C:\workdir
+      - C:\Services\claude-discord-bot\logs:C:\app\logs
