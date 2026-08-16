@@ -1,8 +1,9 @@
 # claude-discord-bot ("Claudiu Remote")
 
 A minimal Discord bot that lets one authorized user run Claude Code prompts
-(headless mode) against a fixed project folder on a Windows machine, via a
-`/claude` slash command posted in one designated channel.
+(headless mode) against a fixed project folder, via a `/claude` slash
+command posted in one designated channel. Deployable on a Windows account
+or on a Linux MicroK8s cluster.
 
 Locked down by design:
 - Only the Discord user ID in `OWNER_DISCORD_ID` can trigger commands.
@@ -13,9 +14,9 @@ Locked down by design:
 - `tools:full` (Bash/shell access) requires an explicit Run/Cancel button
   click before anything executes — it doesn't run automatically just because
   you typed the command. `readonly` and `edit` still run immediately.
-- Runs either under a dedicated low-privilege Windows account (step 3) or,
-  for stronger isolation, inside a Hyper-V isolated Windows container (step
-  7) that can't see the host filesystem at all beyond one mounted folder.
+- Runs under a dedicated low-privilege Windows account (step 3), or on a
+  Linux MicroK8s cluster (step 7) — pick whichever matches your
+  infrastructure.
 
 ## 1. Create the Discord application
 
@@ -217,96 +218,120 @@ Windows edition.
 
 To stop/disable later: right-click the task → **Disable** or **End**.
 
-## 7. Container deployment (strongest isolation — recommended over steps 3/5/6)
+## 7. MicroK8s deployment (Linux, alternative to steps 3-6)
 
-If you want the bot to have **zero visibility into the rest of the host
-filesystem, not even read**, run it inside a Hyper-V isolated Windows
-container instead of as the `claudebot` account directly. Bare metal +
-Windows Server 2025 + Docker (your setup) supports this natively — no nested
-virtualization needed.
+If you already run a MicroK8s (or any Kubernetes) cluster on a Linux host,
+this is simpler than the Windows account path above: smaller images
+(`python:3.12-slim` vs. multi-GB Windows base images), Bash works natively
+instead of needing Git Bash, and there's no Windows image-tag/registry
+flakiness to fight. Uses `Dockerfile` and the manifests in `deploy/`.
 
-With `--isolation=hyperv`, the container runs its own kernel. It cannot see
-`C:\Windows`, `C:\Users`, other drives, or anything else on the host — only
-whatever you explicitly mount with `-v`. This replaces steps 3 (the
-low-privilege account), 5 (manual run), and 6 (Task Scheduler) entirely; you
-still need steps 1, 2, and 4 (Discord app, IDs, `.env` values).
+Still need steps 1 and 2 (Discord app, IDs). Skip 3 through 6 entirely.
 
-**7a. Prepare the project folder and `.env`**
+**7a. Create the two host directories**, on whichever node will run the pod
+(for a single-node MicroK8s VM, that's just the VM itself):
 
-You don't need the `C:\Services\claude-discord-bot` NTFS permissions from
-step 3b anymore — the container boundary replaces that. You do still need
-the project folder Claude is allowed to touch:
-
-```powershell
-mkdir C:\Services\claude-project
-mkdir C:\Services\claude-discord-bot\logs
+```bash
+sudo mkdir -p /opt/claude-discord-bot/workdir /opt/claude-discord-bot/logs
+sudo chown -R 10001:10001 /opt/claude-discord-bot
 ```
 
-Edit `.env` (copy from `.env.example` if you haven't) with one difference
-from step 4: set `CLAUDE_WORKDIR=C:\workdir` — that's the path *inside* the
-container, mapped to `C:\Services\claude-project` on the host via the volume
-mount in `docker-compose.yml`.
+uid `10001` is the non-root `claudebot` user baked into the image by the
+`Dockerfile` — keep them matching if you change one. `workdir` is
+`CLAUDE_WORKDIR`, the only folder Claude can touch; `logs` is where
+`bot.log` and long results land.
 
-For auth, there's no browser inside the container, so run `claude setup-token`
-on any machine that does have one (your laptop is fine) and put the result
-in `.env` as `CLAUDE_CODE_OAUTH_TOKEN` — this authenticates against your
-existing claude.ai subscription rather than a separate API key, and the
-token just needs to exist as an env var inside the container, no login step
-required there. (`ANTHROPIC_API_KEY` still works too, if you'd rather bill
-separately via the Anthropic Console instead of your subscription.)
+**7b. Configure `deploy/secret.yaml`**
 
-**7b. Build and run with Docker Compose**
+Unlike the Windows paths, this one doesn't use `.env` at all — the bot's
+config and secrets come from a Kubernetes `Secret` object instead.
+`deploy/secret.yaml` is already in the repo (and, like the rest of
+`deploy/`, gitignored) with the fields laid out and commented:
 
-`docker-compose.yml` is already in the repo, alongside the `Dockerfile`. It
-builds the image, runs it with `--isolation=hyperv`, and mounts the same two
-folders as before. From `C:\Services\claude-discord-bot` on the server:
-
-```powershell
-docker compose up -d --build
+```bash
+$EDITOR deploy/secret.yaml
 ```
 
-If the base image tag in the `Dockerfile`
-(`python:3.12-windowsservercore-ltsc2025`) isn't published yet, swap it for
-the closest available tag (e.g. `-ltsc2022`) — Hyper-V isolation doesn't
-require the image build to match the host build the way process isolation
-does.
+Replace the `REPLACE_ME` placeholders: `DISCORD_BOT_TOKEN`,
+`OWNER_DISCORD_ID`, `CLAUDE_CHANNEL_ID` (steps 1–2), and
+`CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_TOKEN_EXPIRES_ON` (from
+`claude setup-token`, run on any machine with a browser). Leave
+`CLAUDE_WORKDIR: "/workdir"` as-is — that's the in-container mount path,
+mapped to `/opt/claude-discord-bot/workdir` on the node via the `hostPath`
+volume in `deploy/deployment.yaml`.
 
-I can't build/test this image myself (no Windows container runtime
-available where I'm running) — build it and send me any errors and we'll
-fix them together.
+**7c. Build and push the image**
 
-Useful commands:
-```powershell
-docker compose logs -f          # tail the bot's output
-docker compose up -d --build    # rebuild and restart after editing bot.py
-docker compose down             # stop and remove the container
+```bash
+./build.sh
 ```
 
-- `--isolation=hyperv` is the actual isolation boundary — don't drop it.
-- `--restart unless-stopped` makes Docker bring the container back after a
-  reboot or crash, standing in for Task Scheduler/NSSM.
-- The two `-v` mounts are the *only* host paths this container can see.
-  Everything else on the server — other drives, `C:\Users`, `C:\ProgramData`,
-  even most of `C:\Windows` beyond what's baked into the image — is invisible
-  to it, regardless of a `tools:full` Bash command trying to reach outside
-  `C:\workdir`.
+Same pattern as your other deployed apps — builds and pushes to
+`188.34.177.197:32000/claude-discord-bot:latest`, the same registry
+`deploy/deployment.yaml` pulls from. `build.sh` is gitignored (like the rest
+of `deploy/`), so it stays local rather than getting committed.
 
-Check it came up with `docker compose logs -f` — you should see the same
-`Logged in as <botname>` line as the manual-run test in step 5. Test
-`/claude` in Discord as before.
+(If that registry isn't reachable from wherever you're building — e.g.
+you're on a machine without network access to it — the no-registry
+alternative is to build directly on the cluster node and
+`docker save claude-discord-bot:latest | microk8s ctr image import -`, then
+switch `deploy/deployment.yaml`'s `image:` to `claude-discord-bot:latest` with
+`imagePullPolicy: Never`.)
 
-**To update the bot later:** edit `bot.py`/`requirements.txt`, then
-`docker compose up -d --build` again.
+**7d. Deploy**
 
-**Optional cleanup:** if you already created the `claudebot` Windows account
-for the earlier approach, you no longer need it — see "Removing the
-claudebot account" below.
+```bash
+microk8s kubectl apply -f deploy/namespace.yaml
+microk8s kubectl apply -f deploy/secret.yaml
+microk8s kubectl apply -f deploy/deployment.yaml
+```
+
+(Drop the `microk8s` prefix if you've already aliased `kubectl` to it.)
+
+**7e. Verify**
+
+```bash
+microk8s kubectl -n claude-discord-bot logs -f deploy/claude-discord-bot
+```
+
+Look for `Logged in as Claudiu Remote`, then test `/claude` and
+`/claude-status` in the `#claude` channel as before.
+
+**Updating the bot later:**
+
+```bash
+./build.sh
+microk8s kubectl -n claude-discord-bot rollout restart deploy/claude-discord-bot
+```
+
+**Rotating the token / editing config** (e.g. after a `claude setup-token`
+renewal): edit `deploy/secret.yaml`, re-apply it, then restart the pod so it
+picks up the change (updating a Secret doesn't automatically restart pods
+already using it):
+
+```bash
+$EDITOR deploy/secret.yaml
+microk8s kubectl apply -f deploy/secret.yaml
+microk8s kubectl -n claude-discord-bot rollout restart deploy/claude-discord-bot
+```
+
+**Isolation note:** `deploy/deployment.yaml` runs the container as a non-root
+user with all Linux capabilities dropped, which is solid baseline hardening,
+but it's still standard containerd/runc isolation — a shared kernel with the
+host, not an airtight per-pod VM boundary. That's a reasonable tradeoff on a
+MicroK8s box you already trust with other workloads, but it's worth knowing:
+a "can't see the host at all" guarantee here would need a hardened runtime
+class (gVisor or Kata) added to MicroK8s, which these manifests don't set up.
+
+**Keep `replicas: 1`.** A second pod would open a second Discord gateway
+connection using the same bot token and fight the first one — don't scale
+this deployment.
 
 ## Token expiry warnings
 
 `claude setup-token` tokens are valid for one year, and it's easy to forget.
-As long as `CLAUDE_TOKEN_EXPIRES_ON` is set in `.env`, the bot handles this
-two ways:
+As long as `CLAUDE_TOKEN_EXPIRES_ON` is set (`.env` for the account-based
+path, `deploy/secret.yaml` for MicroK8s), the bot handles this two ways:
 
 - **Automatic warnings in `#claude`**, once a day, when the token has 30,
   14, 7, 3, 1, or 0 days left (configurable via `CLAUDE_TOKEN_WARN_DAYS`).
@@ -315,19 +340,19 @@ two ways:
 - **`/claude-status`** — run it anytime to see the workdir and a live
   countdown, without waiting for a scheduled warning.
 
-When you get the warning: run `claude setup-token` again, update both
-`CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_EXPIRES_ON` in `.env`, then
-restart the bot (`docker compose up -d --build` for the container path, or
-restart the Task Scheduler task / re-run `python bot.py` for the
-account-based path).
+When you get the warning: run `claude setup-token` again, then update both
+`CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_EXPIRES_ON` and restart —
+for the account-based path, edit `.env` and restart the Task Scheduler task
+/ re-run `python bot.py`; for MicroK8s, see "Rotating the token" under
+step 7.
 
 If `CLAUDE_TOKEN_EXPIRES_ON` is left blank, none of this runs, and the bot
 logs a one-time warning on startup reminding you it's not tracked.
 
 ## Removing the claudebot account
 
-Since the bot now runs isolated in a container, `claudebot` isn't doing any
-security work anymore and can be deleted. As Administrator:
+If you've moved to the MicroK8s deployment (step 7), `claudebot` isn't doing
+any security work anymore and can be deleted. As Administrator:
 
 ```powershell
 # 1. Drop its explicit permissions from the two folders (do this before
@@ -368,9 +393,9 @@ account.
   `CLAUDE_MAX_TURNS` (default 15) to prevent a single prompt from running away.
 - `tools:full` additionally requires a Run/Cancel button click, owner-only,
   before the command executes.
-- The real backstop for `tools:full` is whichever isolation you used: either
-  `claudebot`'s limited account permissions (step 3), or, more strongly, the
-  Hyper-V container boundary (step 7) — pick one, don't rely on the
-  Discord-side confirmation button alone.
+- The real backstop for `tools:full` is whichever isolation you used:
+  `claudebot`'s limited account permissions (step 3), or the
+  non-root/no-capabilities MicroK8s pod (step 7) — pick one, don't rely on
+  the Discord-side confirmation button alone.
 - Everything is logged to `logs/bot.log`, including rejected/unauthorized
   attempts and confirm/cancel/timeout decisions.
