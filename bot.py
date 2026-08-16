@@ -7,6 +7,7 @@ in a single designated Discord channel.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,12 +28,16 @@ CLAUDE_WORKDIR = Path(os.environ["CLAUDE_WORKDIR"]).resolve()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 MAX_TURNS = os.environ.get("CLAUDE_MAX_TURNS", "15")
+CONFIRM_TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_CONFIRM_TIMEOUT_SECONDS", "60"))
 
 TOOL_PROFILES = {
     "readonly": "Read,Grep,Glob",
     "edit": "Read,Grep,Glob,Edit,Write",
     "full": "Read,Grep,Glob,Edit,Write,Bash",
 }
+
+# Profiles that require an explicit button-click confirmation before running.
+CONFIRM_REQUIRED = {"full"}
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -102,6 +107,41 @@ async def run_claude(prompt: str, tool_profile: str) -> tuple[bool, str]:
     return True, payload.get("result", stdout_text)
 
 
+class ConfirmView(discord.ui.View):
+    """Owner-only Run/Cancel buttons, used to gate risky tool profiles."""
+
+    def __init__(self, owner_id: int, timeout: float = CONFIRM_TIMEOUT_SECONDS):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.value: bool | None = None  # None = timed out with no click
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This confirmation isn't yours to answer.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Run it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        self.stop()
+        await interaction.response.edit_message(content="✅ Confirmed — running…", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        self.stop()
+        await interaction.response.edit_message(content="❌ Cancelled — nothing was run.", view=None)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(content="⌛ Confirmation timed out — nothing was run.", view=None)
+
+
 @tree.command(name="claude", description="Run a Claude Code prompt against the configured project folder")
 @app_commands.describe(
     prompt="What you want Claude to do",
@@ -137,9 +177,27 @@ async def claude_command(
         return
 
     tool_profile = tools.value if tools else "readonly"
-    await interaction.response.defer(thinking=True)
 
-    log.info("User %s requested [%s]: %s", interaction.user, tool_profile, prompt)
+    if tool_profile in CONFIRM_REQUIRED:
+        view = ConfirmView(OWNER_DISCORD_ID)
+        await interaction.response.send_message(
+            f"⚠️ **{tool_profile}** access requested (includes Bash/shell execution):\n"
+            f"```\n{prompt[:1500]}\n```\nConfirm within {CONFIRM_TIMEOUT_SECONDS}s.",
+            view=view,
+        )
+        view.message = await interaction.original_response()
+        await view.wait()
+        if not view.value:
+            log.info(
+                "User %s did not confirm [%s] request (timed out=%s): %s",
+                interaction.user, tool_profile, view.value is None, prompt,
+            )
+            return
+        log.info("User %s confirmed [%s] request: %s", interaction.user, tool_profile, prompt)
+    else:
+        await interaction.response.defer(thinking=True)
+        log.info("User %s requested [%s]: %s", interaction.user, tool_profile, prompt)
+
     start = time.monotonic()
     ok, result = await run_claude(prompt, tool_profile)
     elapsed = time.monotonic() - start
